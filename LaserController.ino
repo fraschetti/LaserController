@@ -48,6 +48,9 @@ const char* SLEEP_MODE_AWAKE = "awake";
 const char* SLEEP_MODE_LIGHT = "light";
 const char* SLEEP_MODE_DEEP = "deep";
 
+const char* STARTED_STR = "Started";
+const char* FINISHED_STR = "Finished";
+
 volatile unsigned long seqNo = 0;
 
 const int INPUT_LASER_KEY = 47;
@@ -108,7 +111,7 @@ volatile int RELAY_OFF_DEBOUNCE[] = { DEFAULT_OFF_DEBOUNCE_MS, DEFAULT_OFF_DEBOU
                                       CHILLER_OFF_DEBOUNCE_MS, DEFAULT_OFF_DEBOUNCE_MS, DEFAULT_OFF_DEBOUNCE_MS,
                                       DEFAULT_OFF_DEBOUNCE_MS, DEFAULT_OFF_DEBOUNCE_MS };
 volatile int RELAY_STATES[] = { HIGH, HIGH, HIGH, HIGH, HIGH, HIGH, HIGH, HIGH };
-volatile long RELAY_LAST_SWITCH[] = { -1, -1, -1, -1, -1, -1, -1, -1 };
+volatile unsigned long RELAY_LAST_SWITCH[] = { 0, 0, 0, 0, 0, 0, 0, 0 };
 
 /* Adapted from the implementation referced below
   Sine fade
@@ -142,14 +145,15 @@ auto timer = timer_create_default();  // create a timer with default settings
 
 const int LIGHT_SLEEP_IDLE_TIME = 10 * 60;  //10 minutes
 const int DEEP_SLEEP_IDLE_TIME = 20 * 60;   //20 minutes
-volatile unsigned long laserIdleStart = -1;
+volatile unsigned long laserIdleStart = 0;
 volatile bool inLightSleep = false;
 volatile bool inDeepSleep = false;
 
 const int POST_JOB_AIR_DELAY = 5;  //seconds
 
-volatile unsigned long jobStartTime = -1;
-volatile unsigned long jobEndTime = -1;
+volatile unsigned long jobStartTime = 0;
+volatile unsigned long jobEndTime = 0;
+volatile unsigned int lastJobElapsed = 0;
 
 const int JSON_BUFFER_SIZE = 500;
 char JSON_BUFFER[JSON_BUFFER_SIZE];
@@ -408,7 +412,7 @@ void readInputStates() {
 }
 
 void evaluateState() {
-  const long now = millis();
+  const unsigned long now = millis();
 
   bool chillerFlowSensorState = INPUT_STATES[INPUT_FLOW_SENSOR_IDX] == HIGH;
   bool chillerSensorState = INPUT_STATES[INPUT_CHILLER_SENSOR_IDX] == HIGH;
@@ -443,21 +447,25 @@ void evaluateState() {
   
   //TODO on any other noticable change, wakeLaser() ? Any way to wake it via lightburn?
 
-  if (!statusSensorState && jobStartTime != -1) {
+  if (!statusSensorState && jobStartTime != 0) {
     jobEndTime = now;
+
+    lastJobElapsed = getJobElapsedTime();
+
     //TODO CHRIS make more useful
-    publishMessage("Finished");
+    publishLogMessage(FINISHED_STR);
   }
 
   if (statusSensorState || windSensorState) {
-    if (jobStartTime == -1) {
+    if (jobStartTime == 0) {
       jobStartTime = now;
-      jobEndTime = -1;
+      jobEndTime = 0;
+      
       //TODO CHRIS make more useful
-      publishMessage("Started");
+      publishLogMessage(STARTED_STR);
     }
   } else {
-    jobStartTime = -1;
+    jobStartTime = 0;
   }
 
   //Laser power supply
@@ -473,12 +481,12 @@ void evaluateState() {
     newAirPrimaryState = true;
     newAirLowState = true;
   } else {
-    const long airDelayMs = POST_JOB_AIR_DELAY * 1000;
+    const unsigned long airDelayMs = POST_JOB_AIR_DELAY * 1000;
     if (now >= (jobEndTime + airDelayMs)) {
       newAirPrimaryState = false;
 
-      //Leave the low air open another second to drain the syste,
-      if (now >= (jobEndTime + airDelayMs + 1000)) {
+      //Leave the low air open longer to drain the system
+      if (now >= (jobEndTime + airDelayMs + 4000)) {
         newAirLowState = false;
       }
     }
@@ -520,8 +528,8 @@ void evaluateState() {
   CURRENT_DOOR_CLOSED = doorClosedSensorState;
 }
 
-int getJobElapsedTime() {
-  if (jobStartTime == -1) {
+unsigned int getJobElapsedTime() {
+  if (jobStartTime == 0) {
     return 0;
   }
 
@@ -561,8 +569,9 @@ bool isRelayEnabled(int arrayIndex) {
 }
 
 void setRelayState(int arrayIndex, int pinNumber, bool state) {
-  unsigned long now = millis();
-  unsigned long timeDelta = now - RELAY_LAST_SWITCH[arrayIndex];
+  const unsigned long now = millis();
+  const unsigned long lastRelaySwitch = RELAY_LAST_SWITCH[arrayIndex];
+  const unsigned long timeDelta = now - lastRelaySwitch;
 
   int relayDebounce;
 
@@ -595,10 +604,11 @@ char* generateStatusJSON() {
   JsonDocument doc;
 
   doc["seqNo"] = ++seqNo;
-  doc["jobElapsedTime"] = getJobElapsedTime();
   doc["idleTime"] = getIdleTime();
-  doc["jobStartTime"] = jobStartTime;
-  doc["jobEndTime"] = jobEndTime;
+  //  doc["jobStartTime"] = jobStartTime;
+  //  doc["jobEndTime"] = jobEndTime;
+  doc["jobElapsedTime"] = getJobElapsedTime();
+  doc["lastJobElapsedTime"] = lastJobElapsed;
   doc["sleepMode"] = getSleepModeStr();
   doc["lightsMode"] = CURRENT_LED_MODE;  //TODO CHRIS translate to string
   doc["lightsLevel"] = ledsFadeCurrentLevel;
@@ -624,10 +634,6 @@ char* generateStatusJSON() {
 
   serializeJson(doc, JSON_BUFFER, JSON_BUFFER_SIZE);
 
-  if (DEBUG) {
-    Serial.println(JSON_BUFFER);
-  }
-
   return JSON_BUFFER;
 }
 
@@ -643,12 +649,22 @@ bool publishLogMessage(StringType logMsg) {
     Serial.println(JSON_BUFFER);
   }
 
-  return JSON_BUFFER;
+  publishMessage(JSON_BUFFER);
+
+  return true;
 }
 
 bool publishStatusMessage(void*) {
-  char* msg = generateStatusJSON();
-  publishMessage(msg);
+  //char* msg = generateStatusJSON();
+  //publishMessage(msg);
+
+  generateStatusJSON();
+
+  if (DEBUG) {
+    Serial.println(JSON_BUFFER);
+  }
+
+  publishMessage(JSON_BUFFER);
 
   return true;  //Keep the timer going
 }
@@ -668,7 +684,7 @@ bool publishMessage(char* msg) {
     return false;
   }
 
-  long start;
+  unsigned long start;
   if (DEBUG) {
     Serial.println("Publishing MQTT message...");
     start = millis();
@@ -677,7 +693,7 @@ bool publishMessage(char* msg) {
   bool publishSucces = mqttClient.publish(MQTT_TOPIC, msg);
 
   if (DEBUG) {
-    long elapsed = millis() - start;
+    unsigned long elapsed = millis() - start;
     Serial.print("Publish success: ");
     Serial.print(boolToBooleanStr(publishSucces));
     Serial.print(", Publish elapsed: ");
@@ -792,7 +808,7 @@ void printDiagnosticsInfo() {
 
 unsigned long getIdleTime() {
   if (laserIdleStart <= 0)
-    return -1;
+    return 0;
 
   return (millis() - laserIdleStart) / 1000;
 }
